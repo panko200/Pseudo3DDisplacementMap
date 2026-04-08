@@ -1,5 +1,9 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.IO;
+using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Controls;
 using YukkuriMovieMaker.Exo;
@@ -12,6 +16,47 @@ namespace Pseudo3DDisplacementMap
     [VideoEffect("疑似3Dディスプレイスメントマップ", ["描画"], ["3d", "displacement", "立体", "メッシュ"])]
     public class DisplacementMapEffect : VideoEffectBase
     {
+        // ▼▼▼ ここから追加 ▼▼▼
+        static DisplacementMapEffect()
+        {
+            LoadNativeLibrary();
+        }
+
+        private static void LoadNativeLibrary()
+        {
+            try
+            {
+                var pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                if (string.IsNullOrEmpty(pluginDir)) return;
+
+                // 実行環境のアーキテクチャを取得 (x64 / x86 / ARM64)
+                string arch = RuntimeInformation.ProcessArchitecture switch
+                {
+                    Architecture.X64 => "win-x64",
+                    Architecture.X86 => "win-x86",
+                    Architecture.Arm64 => "win-arm64",
+                    _ => "win-x64"
+                };
+
+                // runtimesフォルダから正しいアーキテクチャのDLLパスを指定
+                string dllPath = Path.Combine(pluginDir, "runtimes", arch, "native", "libSkiaSharp.dll");
+
+                if (File.Exists(dllPath))
+                {
+                    NativeLibrary.Load(dllPath);
+                }
+                else
+                {
+                    // 以前のバージョンのように直下にある場合のフォールバック
+                    string directPath = Path.Combine(pluginDir, "libSkiaSharp.dll");
+                    if (File.Exists(directPath)) NativeLibrary.Load(directPath);
+                }
+            }
+            catch
+            {
+                // ロードに失敗した場合は無視してSkiaSharp標準の機構に任せる
+            }
+        }
         public override string Label => "疑似3Dディスプレイスメントマップ";
 
         [Display(GroupName = "3D設定", Name = "深度マップ (白黒)", Description = "高さを指定する画像を選択してください。\n白が手前に盛り上がります。")]
