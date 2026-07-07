@@ -13,17 +13,6 @@ YukkuriMovieMaker4 にて動作する映像エフェクトプラグインです�
 該当エフェクトを適用して、深度マップ(白黒)に、白が高い、黒がそのままという方式の画像を入れると、  
 それに合わせて、画像がZ軸側に飛び出します。
 
-深度マップがない画像を3Dっぽく表示させたい場合は、Depth Estimate(もしくは、疑似被写界深度)とアイテム出力エフェクトという二つのプラグインをダウンロード・インストールして来て、Depth Estimate(もしくは、疑似被写界深度にて、デバッグ表示内の、深度マップ(推論悔過)を選択した状態)をアイテム出力エフェクトを使い、画像出力すると、深度マップの画像が得られるので、あとは、その画像を本プラグインにて選択すると、画像から、3D的な表示ができます。
-
-Depth Estimate  
-https://github.com/mes51/YMM_DepthEstimate
-
-疑似被写界深度  
-https://github.com/panko200/PseudoDepthofField
-
-アイテム出力エフェクト  
-https://github.com/tenkonta/YMM4-ImageOutputEffect
-
 ## アンインストール方法
 
 1. YMM4 を起動して`ヘルプ(H)`>`その他`>`プラグインフォルダを開く`をクリックする。
@@ -33,8 +22,10 @@ https://github.com/tenkonta/YMM4-ImageOutputEffect
 ## 注意点
 
 OS : Windows11 (64bit)  
-ゆっくりMovieMaker4 : v4.51.0.1  
+ゆっくりMovieMaker4 : v4.53.0.9  
 にて動作確認をしています。
+
+cam値を手前で渡してください。
 
 他のSkiaSharpを使うプラグインと、使用するバージョンが違う場合、プラグインが競合する可能性があります。
 
@@ -45,9 +36,14 @@ OS : Windows11 (64bit)
 v0.1.0  
 公開
 
+v0.2.0  
+深度推定を内蔵
+
 ## ライセンス
 
 このプラグインは、以下のライブラリを使用しています。
+
+Depth Anything V2のLicenseは、`./License`の中に入っています。
 
 SkiaSharp
 
@@ -56,3 +52,8 @@ SkiaSharp
 
 本プロジェクトは、MIT Licenseのもと公開しています。  
 [MIT License](./LICENSE)
+
+## ビルド時の注意
+
+Depth Anything V2 の ONNX モデル depth_anything_v2_vits_dynamic.onnx を下記リポジトリからダウンロード、プロジェクトのディレクトリ内に配置してください。  
+https://github.com/fabio-sim/Depth-Anything-ONNX

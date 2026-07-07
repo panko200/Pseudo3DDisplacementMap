@@ -16,8 +16,17 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <None Remove="depth_anything_v2_vits_dynamic.onnx" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="depth_anything_v2_vits_dynamic.onnx" />
+  </ItemGroup>
+
+  <ItemGroup>
     <PackageReference Include="SkiaSharp" Version="2.88.8" />
     <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="2.88.8" />
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.22.1" />
   </ItemGroup>
 
   <ItemGroup>

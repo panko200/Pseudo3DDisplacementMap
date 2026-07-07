@@ -1,11 +1,11 @@
 ﻿using SkiaSharp;
-using System; 
-using System.IO; 
-using System.Reflection; 
-using System.Runtime.InteropServices; 
 using System;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Collections.Generic;
 using System.Numerics;
+using System.Buffers;
 using Vortice.DCommon;
 using Vortice.Direct2D1;
 using Vortice.Direct2D1.Effects;
@@ -31,21 +31,36 @@ namespace Pseudo3DDisplacementMap
 
         private ID2D1Bitmap? _outD2DBitmap;
         private AffineTransform2D? _mapTransformEffect;
-
-        // ★メモリリーク対策：出力画像をキャッシュして使い回す
         private ID2D1Image? _transformOutput;
+
+        // =====================================================================
+        // 自動深度推定用のリソース
+        // =====================================================================
+        private ID2D1Bitmap1? _estInputBitmap;
+        private ID2D1Bitmap1? _estTransferBitmap;
+        private float[]? _cachedRawDepth;
+        private int _cachedWidth = -1;
+        private int _cachedHeight = -1;
+        private int _cachedHash = 0;
+
+        private float _emaMin = float.MaxValue;
+        private float _emaMax = float.MinValue;
+        private bool _emaInitialized = false;
+
+        private float[]? _prevDepth;
+        private int _prevDepthW = -1;
+        private int _prevDepthH = -1;
+
+        private SKBitmap? _estimatedHeightMap;
 
         public DisplacementMapEffectProcessor(IGraphicsDevicesAndContext devices, DisplacementMapEffect item)
         {
             _devices = devices;
             _item = item;
             _mapTransformEffect = new AffineTransform2D(_devices.DeviceContext);
-
-            // ★メモリリーク対策：コンストラクタで1回だけOutputの参照を取得しておく
             _transformOutput = _mapTransformEffect.Output;
         }
 
-        // ★メモリリーク対策：毎回 GetOutput() を呼ばずにキャッシュを返す
         public ID2D1Image Output => _transformOutput ?? _input!;
 
         public void SetInput(ID2D1Image? input) { _input = input; }
@@ -105,12 +120,16 @@ namespace Pseudo3DDisplacementMap
 
         private unsafe float GetHeightValue(float u, float v)
         {
-            if (_cachedHeightMap == null) return 0f;
-            int x = Math.Clamp((int)(u * _cachedHeightMap.Width), 0, _cachedHeightMap.Width - 1);
-            int y = Math.Clamp((int)(v * _cachedHeightMap.Height), 0, _cachedHeightMap.Height - 1);
+            SKBitmap? map = _item.DepthSource == DisplacementMapEffect.DepthSourceType.External
+                ? _cachedHeightMap
+                : _estimatedHeightMap;
 
-            int bpp = _cachedHeightMap.BytesPerPixel;
-            byte* p = (byte*)_cachedHeightMap.GetPixels() + y * _cachedHeightMap.RowBytes + x * bpp;
+            if (map == null) return 0f;
+            int x = Math.Clamp((int)(u * map.Width), 0, map.Width - 1);
+            int y = Math.Clamp((int)(v * map.Height), 0, map.Height - 1);
+
+            int bpp = map.BytesPerPixel;
+            byte* p = (byte*)map.GetPixels() + y * map.RowBytes + x * bpp;
 
             if (bpp == 4)
                 return (p[2] * 0.299f + p[1] * 0.587f + p[0] * 0.114f) / 255f;
@@ -130,21 +149,31 @@ namespace Pseudo3DDisplacementMap
             var drawDesc = desc.DrawDescription;
             var dc = _devices.DeviceContext;
 
-            if (_item.HeightMapPath != _loadedHeightPath)
-            {
-                _loadedHeightPath = _item.HeightMapPath;
-                _cachedHeightMap?.Dispose();
-                if (System.IO.File.Exists(_loadedHeightPath))
-                    _cachedHeightMap = SKBitmap.Decode(_loadedHeightPath);
-                else
-                    _cachedHeightMap = null;
-            }
-
             Vortice.RawRectF rawBounds;
             try { rawBounds = dc.GetImageLocalBounds(_input); } catch { return drawDesc; }
             int imgW = (int)Math.Ceiling(rawBounds.Right) - (int)Math.Floor(rawBounds.Left);
             int imgH = (int)Math.Ceiling(rawBounds.Bottom) - (int)Math.Floor(rawBounds.Top);
             if (imgW <= 0 || imgH <= 0) return drawDesc;
+
+            // =====================================================================
+            // 深度ソースの更新処理
+            // =====================================================================
+            if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.Estimate)
+            {
+                UpdateDepthMap(desc, imgW, imgH, rawBounds);
+            }
+            else
+            {
+                if (_item.HeightMapPath != _loadedHeightPath)
+                {
+                    _loadedHeightPath = _item.HeightMapPath;
+                    _cachedHeightMap?.Dispose();
+                    if (System.IO.File.Exists(_loadedHeightPath))
+                        _cachedHeightMap = SKBitmap.Decode(_loadedHeightPath);
+                    else
+                        _cachedHeightMap = null;
+                }
+            }
 
             float d2r = (float)Math.PI / 180.0f;
             Matrix4x4 localRotation = Matrix4x4.CreateRotationZ(drawDesc.Rotation.Z * d2r) *
@@ -364,6 +393,180 @@ namespace Pseudo3DDisplacementMap
             };
         }
 
+        // =====================================================================
+        // 深度推定マップの構築処理
+        // =====================================================================
+        private unsafe void UpdateDepthMap(EffectDescription desc, int imgW, int imgH, Vortice.RawRectF rawBounds)
+        {
+            int estW = _item.InputWidth * 14;
+            int estH = _item.InputHeight * 14;
+
+            if (_estInputBitmap == null || _estTransferBitmap == null ||
+                _estInputBitmap.PixelSize.Width != estW || _estInputBitmap.PixelSize.Height != estH)
+            {
+                _estInputBitmap?.Dispose();
+                _estTransferBitmap?.Dispose();
+
+                ResetAllState();
+
+                try
+                {
+                    var dc = _devices.DeviceContext;
+                    _estInputBitmap = dc.CreateBitmap(new SizeI(estW, estH), IntPtr.Zero, 0, new BitmapProperties1(new PixelFormat(Format.R32G32B32A32_Float, Vortice.DCommon.AlphaMode.Premultiplied), 96, 96, BitmapOptions.Target));
+                    _estTransferBitmap = dc.CreateBitmap(new SizeI(estW, estH), IntPtr.Zero, 0, new BitmapProperties1(new PixelFormat(Format.R32G32B32A32_Float, Vortice.DCommon.AlphaMode.Premultiplied), 96, 96, BitmapOptions.CpuRead | BitmapOptions.CannotDraw));
+                }
+                catch
+                {
+                    return;
+                }
+            }
+
+            var localContext = _devices.DeviceContext;
+            localContext.Transform = Matrix3x2.CreateTranslation(-rawBounds.Left, -rawBounds.Top) * Matrix3x2.CreateScale(estW / (float)imgW, estH / (float)imgH);
+            localContext.Target = _estInputBitmap;
+            localContext.BeginDraw();
+            localContext.Clear(Colors.Black);
+            localContext.DrawImage(_input!);
+            localContext.EndDraw();
+            localContext.Transform = Matrix3x2.Identity;
+
+            _estTransferBitmap!.CopyFromBitmap(_estInputBitmap);
+
+            int pixelCount = estW * estH;
+            var pixelData = ArrayPool<Vector4>.Shared.Rent(pixelCount);
+            try
+            {
+                var map = _estTransferBitmap.Map(MapOptions.Read);
+                int pitchInElements = map.Pitch / sizeof(Vector4);
+                var srcSpan = new ReadOnlySpan<Vector4>(map.Bits.ToPointer(), pitchInElements * estH);
+                for (int y = 0; y < estH; y++)
+                    srcSpan.Slice(y * pitchInElements, estW).CopyTo(pixelData.AsSpan(y * estW, estW));
+                _estTransferBitmap.Unmap();
+
+                int currentHash = ComputeHash(pixelData, pixelCount);
+                float[] rawDepth;
+                if (_cachedRawDepth != null && _cachedWidth == estW && _cachedHeight == estH && _cachedHash == currentHash)
+                {
+                    rawDepth = _cachedRawDepth;
+                }
+                else
+                {
+                    rawDepth = OnnxDepthEstimator.Instance.Estimate(pixelData, estW, estH);
+                    if (rawDepth.Length == 0) return;
+
+                    _cachedRawDepth = rawDepth;
+                    _cachedWidth = estW;
+                    _cachedHeight = estH;
+                    _cachedHash = currentHash;
+                }
+
+                var depth = new float[pixelCount];
+                rawDepth.AsSpan(0, pixelCount).CopyTo(depth);
+
+                var frame = desc.ItemPosition.Frame;
+                var length = desc.ItemDuration.Frame;
+                var fps = desc.FPS;
+
+                if (_item.UseFixedRange)
+                {
+                    const int sampleCount = 1000;
+                    int actualSampleCount = Math.Min(pixelCount, sampleCount);
+                    float[] samples = ArrayPool<float>.Shared.Rent(actualSampleCount);
+
+                    int step = Math.Max(1, pixelCount / actualSampleCount);
+                    for (int i = 0; i < actualSampleCount; i++) samples[i] = depth[i * step];
+                    Array.Sort(samples, 0, actualSampleCount);
+
+                    float rawMin = samples[(int)(actualSampleCount * 0.05)];
+                    float rawMax = samples[(int)(actualSampleCount * 0.95)];
+                    ArrayPool<float>.Shared.Return(samples);
+
+                    float stability = Math.Clamp((float)_item.RangeStability.GetValue(frame, length, fps) / 100f, 0f, 1f);
+                    float adaptRate = 1f - stability;
+
+                    if (!_emaInitialized)
+                    {
+                        _emaMin = rawMin;
+                        _emaMax = rawMax;
+                        _emaInitialized = true;
+                    }
+                    else
+                    {
+                        _emaMin += (rawMin - _emaMin) * adaptRate;
+                        _emaMax += (rawMax - _emaMax) * adaptRate;
+                    }
+
+                    OnnxDepthEstimator.Normalize(depth, _emaMin, _emaMax);
+                }
+                else
+                {
+                    _emaInitialized = false;
+                    _emaMin = float.MaxValue;
+                    _emaMax = float.MinValue;
+                    OnnxDepthEstimator.Normalize(depth);
+                }
+
+                if (_item.UseTemporalSmoothing && _prevDepth != null && _prevDepthW == estW && _prevDepthH == estH)
+                {
+                    float blend = Math.Clamp((float)_item.TemporalBlend.GetValue(frame, length, fps) / 100f, 0f, 0.99f);
+                    for (int i = 0; i < pixelCount; i++)
+                        depth[i] = depth[i] * (1f - blend) + _prevDepth[i] * blend;
+                }
+
+                if (_item.UseTemporalSmoothing)
+                {
+                    if (_prevDepth == null || _prevDepth.Length < pixelCount) _prevDepth = new float[pixelCount];
+                    depth.AsSpan(0, pixelCount).CopyTo(_prevDepth);
+                    _prevDepthW = estW;
+                    _prevDepthH = estH;
+                }
+                else
+                {
+                    _prevDepth = null;
+                }
+
+                if (_estimatedHeightMap == null || _estimatedHeightMap.Width != estW || _estimatedHeightMap.Height != estH)
+                {
+                    _estimatedHeightMap?.Dispose();
+                    _estimatedHeightMap = new SKBitmap(estW, estH, SKColorType.Gray8, SKAlphaType.Opaque);
+                }
+
+                byte* destPixels = (byte*)_estimatedHeightMap.GetPixels();
+                for (int i = 0; i < pixelCount; i++)
+                {
+                    destPixels[i] = (byte)Math.Clamp(depth[i] * 255f, 0f, 255f);
+                }
+            }
+            finally
+            {
+                ArrayPool<Vector4>.Shared.Return(pixelData);
+            }
+        }
+
+        private static int ComputeHash(Vector4[] data, int count)
+        {
+            var hash = new HashCode();
+            const int step = 64;
+            for (int i = 0; i < count; i += step) hash.Add(data[i]);
+            return hash.ToHashCode();
+        }
+
+        private void ResetAllState()
+        {
+            _cachedRawDepth = null;
+            _cachedWidth = -1;
+            _cachedHeight = -1;
+            _cachedHash = 0;
+
+            _emaMin = float.MaxValue;
+            _emaMax = float.MinValue;
+            _emaInitialized = false;
+
+            _prevDepth = null;
+            _prevDepthW = -1;
+            _prevDepthH = -1;
+        }
+
         public void Dispose()
         {
             _cpuReadBitmap?.Dispose();
@@ -373,7 +576,10 @@ namespace Pseudo3DDisplacementMap
             _cachedHeightMap?.Dispose();
             _outD2DBitmap?.Dispose();
 
-            // ★メモリリーク対策：キャッシュしたOutputのDisposeも忘れずに
+            _estInputBitmap?.Dispose();
+            _estTransferBitmap?.Dispose();
+            _estimatedHeightMap?.Dispose();
+
             _transformOutput?.Dispose();
             _mapTransformEffect?.Dispose();
         }
