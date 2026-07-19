@@ -1,21 +1,27 @@
 ﻿using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using YukkuriMovieMaker.Brush;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Controls;
 using YukkuriMovieMaker.Exo;
 using YukkuriMovieMaker.ItemEditor.CustomVisibilityAttributes;
 using YukkuriMovieMaker.Player.Video;
+using YukkuriMovieMaker.Plugin;
+using YukkuriMovieMaker.Plugin.Brush;
 using YukkuriMovieMaker.Plugin.Effects;
+using YukkuriMovieMaker.Project;
 using YukkuriMovieMaker.Settings;
-using System.IO;
-using System.Reflection;
-using System.Runtime.InteropServices;
+using Brush = YukkuriMovieMaker.Plugin.Brush.Brush;
 
 namespace Pseudo3DDisplacementMap
 {
     [VideoEffect("疑似3Dディスプレイスメントマップ", ["描画"], ["3d", "displacement", "立体", "メッシュ"])]
-    public class DisplacementMapEffect : VideoEffectBase
+    public class DisplacementMapEffect : VideoEffectBase, IFileItem, IResourceItem
     {
         static DisplacementMapEffect()
         {
@@ -58,14 +64,16 @@ namespace Pseudo3DDisplacementMap
         public override string Label => "疑似3Dディスプレイスメントマップ";
 
         // =====================================================================
-        // 深度ソース設定（外部画像か深度推定か）
+        // 深度ソース設定
         // =====================================================================
         public enum DepthSourceType
         {
-            [Display(Name = "外部画像")]
+            [Display(Name = "外部画像 (静止画)")]
             External = 1,
             [Display(Name = "自動深度推定")]
-            Estimate = 2
+            Estimate = 2,
+            [Display(Name = "別の画像・シーン (ブラシ)")]
+            Brush = 3
         }
 
         [Display(GroupName = "3D設定", Name = "深度ソース", Description = "深度（高さ）情報の取得元を選択します。")]
@@ -79,8 +87,10 @@ namespace Pseudo3DDisplacementMap
                 {
                     OnPropertyChanged(nameof(IsExternalSource));
                     OnPropertyChanged(nameof(IsEstimateSource));
+                    OnPropertyChanged(nameof(IsBrushSource));
                     OnPropertyChanged(nameof(ShowRangeStability));
                     OnPropertyChanged(nameof(ShowTemporalBlend));
+                    OnPropertyChanged(nameof(Brush)); // ★ ブラシUI全体の再評価を強制する
                 }
             }
         }
@@ -92,6 +102,9 @@ namespace Pseudo3DDisplacementMap
         [Browsable(false)]
         public bool IsEstimateSource => DepthSource == DepthSourceType.Estimate;
 
+        [Browsable(false)]
+        public bool IsBrushSource => DepthSource == DepthSourceType.Brush;
+
         // =====================================================================
         // 3D設定
         // =====================================================================
@@ -100,6 +113,27 @@ namespace Pseudo3DDisplacementMap
         [ShowPropertyEditorWhen(nameof(IsExternalSource), true)]
         public string HeightMapPath { get => heightMapPath; set => Set(ref heightMapPath, value); }
         private string heightMapPath = string.Empty;
+
+        // ★ ブラシの実体を保持するバッファ
+        private readonly Brush brush = CreateBitmapBrush();
+
+        [Display(GroupName = "3D設定", Name = "深度マップ (ブラシ)", Description = "深度ソースとして使用する別の画像やシーンを選択します。", AutoGenerateField = true)]
+        [ShowPropertyEditorWhen(nameof(IsBrushSource), true)] // ★ ヘッダー行の表示制御
+        public Brush? Brush => IsBrushSource ? brush : null; // ★ 非表示（false）の時は null を返して子UIの生成を防ぐ
+
+        // BitmapBrushPluginを裏側から初期化するためのヘルパーメソッド
+        private static Brush CreateBitmapBrush()
+        {
+            var pluginType = PluginLoader.Plugins
+                .OfType<IBrushPlugin>()
+                .FirstOrDefault(p => p.GetType().Name == "BitmapBrushPlugin")?.GetType()
+                ?? PluginLoader.Plugins.OfType<IBrushPlugin>().First().GetType();
+
+            var createMethod = typeof(Brush).GetMethods().First(m => m.Name == "Create" && m.IsGenericMethod);
+            var genericMethod = createMethod.MakeGenericMethod(pluginType);
+
+            return (Brush)genericMethod.Invoke(null, null)!;
+        }
 
         [Display(GroupName = "3D設定", Name = "押し出し量", Description = "立体の奥行き（高さ）の強さです。")]
         [AnimationSlider("F1", "px", -500, 500)]
@@ -230,7 +264,36 @@ namespace Pseudo3DDisplacementMap
         public override IEnumerable<string> CreateExoVideoFilters(int keyFrameIndex, ExoOutputDescription exoOutputDescription) => [];
         public override IVideoEffectProcessor CreateVideoEffect(IGraphicsDevicesAndContext devices) => new DisplacementMapEffectProcessor(devices, this);
 
-        protected override IEnumerable<IAnimatable> GetAnimatables() =>
-            [Depth, SubdivisionX, SubdivisionY, RangeStability, TemporalBlend];
+        // ★ nullを返している間の例外を防ぐため、安全にイテレータを返します
+        protected override IEnumerable<IAnimatable> GetAnimatables()
+        {
+            yield return Depth;
+            yield return SubdivisionX;
+            yield return SubdivisionY;
+            yield return RangeStability;
+            yield return TemporalBlend;
+            yield return brush;
+        }
+
+        // --- パッケージング・ファイルパス一括置換への対応 ---
+        public override IEnumerable<string> GetFiles()
+        {
+            foreach (var file in base.GetFiles()) yield return file;
+            if (brush != null) // ★ 大文字の Brush から 小文字の brush に変更
+                foreach (var file in brush.GetFiles()) yield return file;
+        }
+
+        public override void ReplaceFile(string from, string to)
+        {
+            base.ReplaceFile(from, to);
+            brush?.ReplaceFile(from, to); // ★ 大文字の Brush から 小文字の brush に変更
+        }
+
+        public override IEnumerable<TimelineResource> GetResources()
+        {
+            foreach (var res in base.GetResources()) yield return res;
+            if (brush != null) // ★ 大文字の Brush から 小文字の brush に変更
+                foreach (var res in brush.GetResources()) yield return res;
+        }
     }
 }

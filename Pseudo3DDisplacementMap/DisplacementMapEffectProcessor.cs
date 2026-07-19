@@ -13,6 +13,7 @@ using Vortice.DXGI;
 using Vortice.Mathematics;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Player.Video;
+using YukkuriMovieMaker.Plugin.Brush;
 
 namespace Pseudo3DDisplacementMap
 {
@@ -32,6 +33,15 @@ namespace Pseudo3DDisplacementMap
         private ID2D1Bitmap? _outD2DBitmap;
         private AffineTransform2D? _mapTransformEffect;
         private ID2D1Image? _transformOutput;
+
+        // =====================================================================
+        // 別シーン・別画像（ブラシ）参照用のリソース
+        // =====================================================================
+        private IBrushSource? _brushSource;
+        private ID2D1Bitmap1? _brushCpuReadBitmap;
+        private ID2D1Bitmap1? _brushGpuBitmap;
+        private ID2D1DeviceContext? _brushLocalContext;
+        private DisplacementMapEffect.DepthSourceType _lastDepthSource = (DisplacementMapEffect.DepthSourceType)(-1);
 
         // =====================================================================
         // 自動深度推定用のリソース
@@ -120,9 +130,14 @@ namespace Pseudo3DDisplacementMap
 
         private unsafe float GetHeightValue(float u, float v)
         {
-            SKBitmap? map = _item.DepthSource == DisplacementMapEffect.DepthSourceType.External
-                ? _cachedHeightMap
-                : _estimatedHeightMap;
+            SKBitmap? map = null;
+
+            if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.External)
+                map = _cachedHeightMap;
+            else if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.Estimate)
+                map = _estimatedHeightMap;
+            else if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.Brush)
+                map = _cachedHeightMap; // ブラシの描画データをキャッシュとして再利用
 
             if (map == null) return 0f;
             int x = Math.Clamp((int)(u * map.Width), 0, map.Width - 1);
@@ -156,11 +171,31 @@ namespace Pseudo3DDisplacementMap
             if (imgW <= 0 || imgH <= 0) return drawDesc;
 
             // =====================================================================
+            // 深度ソースが変更された際のリソース解放処理
+            // =====================================================================
+            if (_lastDepthSource != _item.DepthSource)
+            {
+                _lastDepthSource = _item.DepthSource;
+                _cachedHeightMap?.Dispose();
+                _cachedHeightMap = null;
+                _loadedHeightPath = string.Empty;
+
+                _brushCpuReadBitmap?.Dispose(); _brushCpuReadBitmap = null;
+                _brushGpuBitmap?.Dispose(); _brushGpuBitmap = null;
+                _brushLocalContext?.Dispose(); _brushLocalContext = null;
+                _brushSource?.Dispose(); _brushSource = null;
+            }
+
+            // =====================================================================
             // 深度ソースの更新処理
             // =====================================================================
             if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.Estimate)
             {
                 UpdateDepthMap(desc, imgW, imgH, rawBounds);
+            }
+            else if (_item.DepthSource == DisplacementMapEffect.DepthSourceType.Brush)
+            {
+                UpdateBrushMap(desc, imgW, imgH, rawBounds);
             }
             else
             {
@@ -394,6 +429,87 @@ namespace Pseudo3DDisplacementMap
         }
 
         // =====================================================================
+        // 別シーン・別画像（ブラシ）深度マップ構築処理
+        // =====================================================================
+        private void UpdateBrushMap(EffectDescription desc, int width, int height, Vortice.RawRectF rawBounds)
+        {
+            var dc = _devices.DeviceContext;
+            _brushSource ??= _item.Brush.CreateBrush(_devices);
+            _brushSource.Update((TimelineItemSourceDescription)desc);
+
+            int maxTexSize = (int)_item.MaxResolution;
+            float scale = 1.0f;
+            if (width > maxTexSize || height > maxTexSize)
+                scale = Math.Min((float)maxTexSize / width, (float)maxTexSize / height);
+
+            int texW = Math.Max(1, (int)(width * scale));
+            int texH = Math.Max(1, (int)(height * scale));
+
+            if (_brushCpuReadBitmap == null || _brushCpuReadBitmap.PixelSize.Width != texW || _brushCpuReadBitmap.PixelSize.Height != texH)
+            {
+                _brushCpuReadBitmap?.Dispose();
+                _brushGpuBitmap?.Dispose();
+                _brushLocalContext?.Dispose();
+                _cachedHeightMap?.Dispose(); // 既存の外部画像または前サイズのキャッシュを解放
+
+                _brushCpuReadBitmap = dc.CreateBitmap(
+                    new SizeI(texW, texH),
+                    IntPtr.Zero,
+                    0,
+                    new BitmapProperties1(
+                        new PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                        96,
+                        96,
+                        BitmapOptions.CpuRead | BitmapOptions.CannotDraw
+                    )
+                );
+                _brushLocalContext = dc.Device.CreateDeviceContext(DeviceContextOptions.None);
+                _brushGpuBitmap = _brushLocalContext.CreateBitmap(
+                    new SizeI(texW, texH),
+                    new BitmapProperties1(
+                        new PixelFormat(Format.B8G8R8A8_UNorm, Vortice.DCommon.AlphaMode.Premultiplied),
+                        96,
+                        96,
+                        BitmapOptions.Target
+                    )
+                );
+                _brushLocalContext.Target = _brushGpuBitmap;
+                _cachedHeightMap = new SKBitmap(texW, texH, SKColorType.Bgra8888, SKAlphaType.Premul);
+            }
+
+            // GPUコンテキストを使用してブラシを描画
+            _brushLocalContext!.BeginDraw();
+            _brushLocalContext.Clear(new Vortice.Mathematics.Color4(0, 0, 0, 0));
+            _brushLocalContext.Transform = Matrix3x2.CreateTranslation(-rawBounds.Left, -rawBounds.Top) * Matrix3x2.CreateScale(scale);
+            _brushLocalContext.FillRectangle(rawBounds, _brushSource.Brush);
+            _brushLocalContext.EndDraw();
+            _brushLocalContext.Transform = Matrix3x2.Identity;
+
+            // CPU読み込み用テクスチャにコピーして、SKBitmapに展開する
+            _brushCpuReadBitmap!.CopyFromBitmap(_brushGpuBitmap);
+            var map = _brushCpuReadBitmap.Map(MapOptions.Read);
+            try
+            {
+                unsafe
+                {
+                    byte* srcPtr = (byte*)map.Bits;
+                    byte* dstPtr = (byte*)_cachedHeightMap!.GetPixels();
+                    long srcPitch = map.Pitch;
+                    long dstPitch = _cachedHeightMap.RowBytes;
+
+                    for (int y = 0; y < texH; y++)
+                    {
+                        Buffer.MemoryCopy(srcPtr + y * srcPitch, dstPtr + y * dstPitch, dstPitch, Math.Min(srcPitch, dstPitch));
+                    }
+                }
+            }
+            finally
+            {
+                _brushCpuReadBitmap.Unmap();
+            }
+        }
+
+        // =====================================================================
         // 深度推定マップの構築処理
         // =====================================================================
         private unsafe void UpdateDepthMap(EffectDescription desc, int imgW, int imgH, Vortice.RawRectF rawBounds)
@@ -582,6 +698,12 @@ namespace Pseudo3DDisplacementMap
 
             _transformOutput?.Dispose();
             _mapTransformEffect?.Dispose();
+
+            // ブラシ（別シーン）関連リソースの解放
+            _brushCpuReadBitmap?.Dispose();
+            _brushGpuBitmap?.Dispose();
+            _brushLocalContext?.Dispose();
+            _brushSource?.Dispose();
         }
 
         private class GridFace
