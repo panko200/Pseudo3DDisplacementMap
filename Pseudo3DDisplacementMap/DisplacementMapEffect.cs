@@ -1,10 +1,12 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.ComponentModel.DataAnnotations;
 using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using SkiaSharp;
 using YukkuriMovieMaker.Brush;
 using YukkuriMovieMaker.Commons;
 using YukkuriMovieMaker.Controls;
@@ -25,39 +27,52 @@ namespace Pseudo3DDisplacementMap
     {
         static DisplacementMapEffect()
         {
-            LoadNativeLibrary();
+            RegisterSkiaNativeResolver();
         }
 
-        private static void LoadNativeLibrary()
+        private static bool _isResolverRegistered = false;
+
+        private static void RegisterSkiaNativeResolver()
         {
+            if (_isResolverRegistered) return;
+            _isResolverRegistered = true;
+
             try
             {
-                var pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-                if (string.IsNullOrEmpty(pluginDir)) return;
-
-                string arch = RuntimeInformation.ProcessArchitecture switch
+                NativeLibrary.SetDllImportResolver(typeof(SKObject).Assembly, (libraryName, assembly, searchPath) =>
                 {
-                    Architecture.X64 => "win-x64",
-                    Architecture.X86 => "win-x86",
-                    Architecture.Arm64 => "win-arm64",
-                    _ => "win-x64"
-                };
+                    if (libraryName == "libSkiaSharp")
+                    {
+                        var pluginDir = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
+                        if (!string.IsNullOrEmpty(pluginDir))
+                        {
+                            string arch = RuntimeInformation.ProcessArchitecture switch
+                            {
+                                Architecture.X64 => "win-x64",
+                                Architecture.X86 => "win-x86",
+                                Architecture.Arm64 => "win-arm64",
+                                _ => "win-x64"
+                            };
 
-                string dllPath = Path.Combine(pluginDir, "runtimes", arch, "native", "libSkiaSharp.dll");
+                            string dllPath = Path.Combine(pluginDir, "runtimes", arch, "native", "libSkiaSharp.dll");
+                            if (File.Exists(dllPath) && NativeLibrary.TryLoad(dllPath, out IntPtr handle))
+                            {
+                                return handle;
+                            }
 
-                if (File.Exists(dllPath))
-                {
-                    NativeLibrary.Load(dllPath);
-                }
-                else
-                {
-                    string directPath = Path.Combine(pluginDir, "libSkiaSharp.dll");
-                    if (File.Exists(directPath)) NativeLibrary.Load(directPath);
-                }
+                            string directPath = Path.Combine(pluginDir, "libSkiaSharp.dll");
+                            if (File.Exists(directPath) && NativeLibrary.TryLoad(directPath, out IntPtr handleDirect))
+                            {
+                                return handleDirect;
+                            }
+                        }
+                    }
+                    return IntPtr.Zero;
+                });
             }
             catch
             {
-                // ロードに失敗した場合は無視
+                // 無視
             }
         }
 
@@ -90,7 +105,7 @@ namespace Pseudo3DDisplacementMap
                     OnPropertyChanged(nameof(IsBrushSource));
                     OnPropertyChanged(nameof(ShowRangeStability));
                     OnPropertyChanged(nameof(ShowTemporalBlend));
-                    OnPropertyChanged(nameof(Brush)); // ★ ブラシUI全体の再評価を強制する
+                    OnPropertyChanged(nameof(Brush));
                 }
             }
         }
@@ -114,14 +129,12 @@ namespace Pseudo3DDisplacementMap
         public string HeightMapPath { get => heightMapPath; set => Set(ref heightMapPath, value); }
         private string heightMapPath = string.Empty;
 
-        // ★ ブラシの実体を保持するバッファ
         private readonly Brush brush = CreateBitmapBrush();
 
         [Display(GroupName = "3D設定", Name = "深度マップ (ブラシ)", Description = "深度ソースとして使用する別の画像やシーンを選択します。", AutoGenerateField = true)]
-        [ShowPropertyEditorWhen(nameof(IsBrushSource), true)] // ★ ヘッダー行の表示制御
-        public Brush? Brush => IsBrushSource ? brush : null; // ★ 非表示（false）の時は null を返して子UIの生成を防ぐ
+        [ShowPropertyEditorWhen(nameof(IsBrushSource), true)]
+        public Brush? Brush => IsBrushSource ? brush : null;
 
-        // BitmapBrushPluginを裏側から初期化するためのヘルパーメソッド
         private static Brush CreateBitmapBrush()
         {
             var pluginType = PluginLoader.Plugins
@@ -264,7 +277,6 @@ namespace Pseudo3DDisplacementMap
         public override IEnumerable<string> CreateExoVideoFilters(int keyFrameIndex, ExoOutputDescription exoOutputDescription) => [];
         public override IVideoEffectProcessor CreateVideoEffect(IGraphicsDevicesAndContext devices) => new DisplacementMapEffectProcessor(devices, this);
 
-        // ★ nullを返している間の例外を防ぐため、安全にイテレータを返します
         protected override IEnumerable<IAnimatable> GetAnimatables()
         {
             yield return Depth;
@@ -275,24 +287,23 @@ namespace Pseudo3DDisplacementMap
             yield return brush;
         }
 
-        // --- パッケージング・ファイルパス一括置換への対応 ---
         public override IEnumerable<string> GetFiles()
         {
             foreach (var file in base.GetFiles()) yield return file;
-            if (brush != null) // ★ 大文字の Brush から 小文字の brush に変更
+            if (brush != null)
                 foreach (var file in brush.GetFiles()) yield return file;
         }
 
         public override void ReplaceFile(string from, string to)
         {
             base.ReplaceFile(from, to);
-            brush?.ReplaceFile(from, to); // ★ 大文字の Brush から 小文字の brush に変更
+            brush?.ReplaceFile(from, to);
         }
 
         public override IEnumerable<TimelineResource> GetResources()
         {
             foreach (var res in base.GetResources()) yield return res;
-            if (brush != null) // ★ 大文字の Brush から 小文字の brush に変更
+            if (brush != null)
                 foreach (var res in brush.GetResources()) yield return res;
         }
     }
